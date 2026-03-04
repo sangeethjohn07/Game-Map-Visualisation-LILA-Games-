@@ -199,6 +199,7 @@ export default function MapCanvas({
   showHeatmap,
   heatmapType,
   noMatchSelected,
+  resetViewKey,     // increment to trigger zoom/pan reset
 }) {
   const [tooltip, setTooltip] = useState(null); // { text, x, y } in screen coords
 
@@ -231,6 +232,11 @@ export default function MapCanvas({
     pan.current = { x: 0, y: 0 };
     applyTransform();
   }, [applyTransform]);
+
+  // External reset trigger (from toolbar Reset button)
+  useEffect(() => {
+    if (resetViewKey > 0) resetView();
+  }, [resetViewKey, resetView]);
 
   const zoomBy = useCallback((factor, cx = 0, cy = 0) => {
     const newZ = Math.max(0.3, Math.min(10, zoom.current * factor));
@@ -308,14 +314,20 @@ export default function MapCanvas({
     setTooltip(null);
   }, [onMouseUp]);
 
+  // Increment to force a re-render (and thus a draw()) after image loads
+  const [, setImgSeq] = useState(0);
+
   // ── Load minimap image ─────────────────────────────────────────────────────
   useEffect(() => {
-    if (!mapId || loadedMapRef.current === mapId) return;
+    if (!mapId) return;
+    // Always reload when mapId changes — don't skip if same map was previously loaded
+    imgRef.current = null;
+    loadedMapRef.current = null;
     const filename = MINIMAP_FILES[mapId] ?? `${mapId}_Minimap.png`;
     const img = new Image();
     img.src = `/minimaps/${filename}`;
-    img.onload  = () => { imgRef.current = img; loadedMapRef.current = mapId; };
-    img.onerror = () => { imgRef.current = null; loadedMapRef.current = mapId; };
+    img.onload  = () => { imgRef.current = img; loadedMapRef.current = mapId; setImgSeq(n => n + 1); };
+    img.onerror = () => { imgRef.current = null; loadedMapRef.current = mapId; setImgSeq(n => n + 1); };
   }, [mapId]);
 
   // ── Heatmap computation (timeline-aware, memoised by events + type) ───────
@@ -347,18 +359,20 @@ export default function MapCanvas({
   }, [events]);
 
   // ── Player last positions (for hover tooltip) ─────────────────────────────
-  // Last trail point per player (or fall back to start position)
+  // One entry per (userId, matchId) pair so tooltip works across all trail segments.
   const playerLastPositions = useMemo(() => {
     const positions = {};
     for (const [uid, matchSegs] of Object.entries(trails)) {
-      let last = null;
-      for (const pts of Object.values(matchSegs)) {
-        if (pts.length > 0) last = pts.at(-1);
+      for (const [matchId, pts] of Object.entries(matchSegs)) {
+        if (pts.length > 0) {
+          positions[`${uid}:${matchId}`] = pts.at(-1);
+        }
       }
-      if (last) positions[uid] = last;
     }
+    // Fall back to start positions for any (userId, matchId) not covered by trails
     for (const sp of (startPositions ?? [])) {
-      if (!positions[sp.userId]) positions[sp.userId] = sp;
+      const key = `${sp.userId}:${sp.matchId ?? 'default'}`;
+      if (!positions[key]) positions[key] = sp;
     }
     return positions;
   }, [trails, startPositions]);
@@ -429,21 +443,23 @@ export default function MapCanvas({
         ctx.lineWidth = 2;
         ctx.globalAlpha = 0.72;
 
-        let lastPt = null;
+        // Draw all trail segments, then a position dot at the end of each
+        const endPts = [];
         for (const pts of Object.values(matchSegments)) {
           if (pts.length < 2) continue;
+          ctx.globalAlpha = 0.72;
           ctx.beginPath();
           ctx.moveTo(pts[0].pixelX, pts[0].pixelY);
           for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].pixelX, pts[i].pixelY);
           ctx.stroke();
-          lastPt = pts.at(-1);
+          endPts.push(pts.at(-1));
         }
 
-        // Current-position dot at the most recent trail point across all match segments
-        if (lastPt) {
+        // Draw a position dot at the end of every match segment
+        for (const pt of endPts) {
           ctx.globalAlpha = 1;
           ctx.beginPath();
-          ctx.arc(lastPt.pixelX, lastPt.pixelY, 4, 0, Math.PI * 2);
+          ctx.arc(pt.pixelX, pt.pixelY, 4, 0, Math.PI * 2);
           ctx.fillStyle = color;
           ctx.fill();
           ctx.strokeStyle = '#fff';

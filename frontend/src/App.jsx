@@ -1,6 +1,7 @@
 import React, {
   useState, useEffect, useRef, useCallback, useMemo,
 } from 'react';
+import { createPortal } from 'react-dom';
 import clsx from 'clsx';
 import { fetchMaps, fetchDates, fetchMatches, fetchMatch, fetchPlayerMatches } from './api';
 import MapCanvas from './Canvas';
@@ -202,6 +203,7 @@ function HistoryPanel({ history, onRestore, onRename, onDelete, onClear, onClose
                 <div className="text-[10px] text-slate-600 mt-0.5">
                   {new Date(item.savedAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   {' · '}{item.state.selectedMatchIds.length} match{item.state.selectedMatchIds.length !== 1 ? 'es' : ''}
+                  {item.state.currentTime > 0 && <span className="text-indigo-500/70"> · ⏱ {fmtMs(item.state.currentTime)}</span>}
                 </div>
               </button>
             )}
@@ -244,7 +246,7 @@ function HistoryPanel({ history, onRestore, onRename, onDelete, onClear, onClose
 // Player context menu
 // ---------------------------------------------------------------------------
 
-function PlayerMenu({ userId, isBot, x, y, onClose, onSelectAllMatches }) {
+function PlayerMenu({ userId, isBot, x, y, onClose, onSelectAllMatches, isAllSelected }) {
   const ref = useRef(null);
   useEffect(() => {
     const fn = e => { if (ref.current && !ref.current.contains(e.target)) onClose(); };
@@ -262,10 +264,16 @@ function PlayerMenu({ userId, isBot, x, y, onClose, onSelectAllMatches }) {
         {isBot ? `Bot #${userId}` : userId.slice(0, 20) + '…'}
       </div>
       <button
-        className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-panel hover:text-white transition"
+        className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-panel hover:text-white transition flex items-center gap-2"
         onClick={onSelectAllMatches}
       >
-        📋 Select all matches for this player
+        <span className={clsx(
+          'w-3.5 h-3.5 border rounded-sm inline-flex items-center justify-center flex-none transition',
+          isAllSelected ? 'border-indigo-400 bg-indigo-600/20' : 'border-slate-500',
+        )}>
+          {isAllSelected && <span className="text-indigo-400 text-[9px] leading-none">✓</span>}
+        </span>
+        All matches for player
       </button>
     </div>
   );
@@ -293,9 +301,15 @@ export default function App() {
   const [playerSearch,      setPlayerSearch]      = useState('');
   const sortMenuRef = useRef(null);
 
-  // Close sort menu on outside click
+  // Close sort / speed menus on outside click
   useEffect(() => {
-    const fn = e => { if (sortMenuRef.current && !sortMenuRef.current.contains(e.target)) setShowSortMenu(false); };
+    const fn = e => {
+      if (sortMenuRef.current && !sortMenuRef.current.contains(e.target)) setShowSortMenu(false);
+      const inSpeedControl =
+        speedBtnContainerRef.current?.contains(e.target) ||
+        speedPopupRef.current?.contains(e.target);
+      if (!inSpeedControl) setShowSpeedMenu(false);
+    };
     document.addEventListener('mousedown', fn);
     return () => document.removeEventListener('mousedown', fn);
   }, []);
@@ -303,6 +317,7 @@ export default function App() {
   // ── Loaded match data ─────────────────────────────────────────────────────
   const [matchDataMap,    setMatchDataMap]   = useState(new Map());
   const [loadingMatches,  setLoadingMatches] = useState(new Set());
+  const [resetViewKey,    setResetViewKey]   = useState(0); // increment to reset Canvas zoom/pan
 
   // ── Display ───────────────────────────────────────────────────────────────
   const [selectedPlayers, setSelectedPlayers] = useState(new Set());
@@ -310,8 +325,14 @@ export default function App() {
   const [showEvents,  setShowEvents]  = useState(true);
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [heatmapType, setHeatmapType] = useState('traffic');
-  const [isPlaying,   setIsPlaying]   = useState(false);
-  const [playSpeed,   setPlaySpeed]   = useState(1);
+  const [isPlaying,    setIsPlaying]   = useState(false);
+  const [playSpeed,    setPlaySpeed]   = useState(1);
+  const [showSpeedMenu, setShowSpeedMenu] = useState(false);
+  const speedBtnContainerRef = useRef(null); // wrapping div (for outside-click detection)
+  const speedBtnRef          = useRef(null); // button element (for getBoundingClientRect)
+  const speedPopupRef        = useRef(null); // portal popup (for outside-click detection)
+  const pendingPlayerFilter  = useRef(null); // userId to restrict auto-select to after loading
+  const [playerMatchCache, setPlayerMatchCache] = useState(new Map()); // userId → matchId[]
 
   // ── Playback refs (avoid stale closures in RAF) ───────────────────────────
   const currentTimeRef = useRef(0);
@@ -411,12 +432,27 @@ export default function App() {
 
   // ── Auto-select all players when new matches load ─────────────────────────
   useEffect(() => {
+    // When "select all matches for player" is pending, skip auto-adding everyone
+    if (pendingPlayerFilter.current !== null) return;
     setSelectedPlayers(prev => {
       const n = new Set(prev);
       for (const m of matchDataMap.values()) for (const p of m.players) n.add(p.userId);
       return n;
     });
   }, [matchDataMap]);
+
+  // Apply player restriction once all pending match IDs are loaded
+  useEffect(() => {
+    if (pendingPlayerFilter.current === null) return;
+    const allLoaded = selectedMatchIds.size > 0 &&
+      [...selectedMatchIds].every(id => matchDataMap.has(id));
+    if (allLoaded) {
+      const uid = pendingPlayerFilter.current;
+      pendingPlayerFilter.current = null;
+      setSelectedPlayers(new Set([uid]));
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matchDataMap, selectedMatchIds]);
 
   // ── Derived data ──────────────────────────────────────────────────────────
   const allPlayers = useMemo(() => {
@@ -435,7 +471,10 @@ export default function App() {
   const allEvents = useMemo(() => {
     const evs = [];
     for (const [matchId, m] of matchDataMap.entries()) {
-      for (const ev of m.events) evs.push({ ...ev, matchId });
+      const playerLookup = Object.fromEntries(m.players.map(p => [p.userId, p]));
+      for (const ev of m.events) {
+        evs.push({ ...ev, matchId, isBot: playerLookup[ev.userId]?.isBot ?? false });
+      }
     }
     evs.sort((a, b) => a.ts - b.ts);
     return evs;
@@ -450,8 +489,9 @@ export default function App() {
   const startPositions = useMemo(() => {
     const starts = {};
     for (const ev of allEvents) {
-      if (!starts[ev.userId] && selectedPlayers.has(ev.userId)) {
-        starts[ev.userId] = { ...ev, color: colorMap[ev.userId] ?? '#888' };
+      const key = `${ev.userId}:${ev.matchId ?? 'default'}`;
+      if (!starts[key] && selectedPlayers.has(ev.userId)) {
+        starts[key] = { ...ev, color: colorMap[ev.userId] ?? '#888' };
       }
     }
     return Object.values(starts);
@@ -530,6 +570,21 @@ export default function App() {
     return () => { if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; } };
   }, [isPlaying, tick]);
 
+  // ── Spacebar to play / pause ───────────────────────────────────────────────
+  useEffect(() => {
+    const fn = e => {
+      if (e.code !== 'Space') return;
+      const tag = e.target.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      e.preventDefault();
+      if (durationRef.current <= 0) return; // no match loaded
+      if (currentTimeRef.current >= durationRef.current) setCurrentTime(0);
+      setIsPlaying(v => !v);
+    };
+    window.addEventListener('keydown', fn);
+    return () => window.removeEventListener('keydown', fn);
+  }, [setCurrentTime]); // setCurrentTime is stable
+
   // ── History helpers ───────────────────────────────────────────────────────
   const captureState = useCallback(() => ({
     selectedMap,
@@ -537,6 +592,7 @@ export default function App() {
     selectedMatchIds: [...selectedMatchIds],
     selectedPlayers: [...selectedPlayers],
     showTrails, showEvents, showHeatmap, heatmapType,
+    currentTime: currentTimeRef.current,
   }), [selectedMap, selectedDates, selectedMatchIds, selectedPlayers, showTrails, showEvents, showHeatmap, heatmapType]);
 
   // Save to history when matches are selected (suppressed during restore to preserve renamed labels)
@@ -561,10 +617,29 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedMatchIds]);
 
+  // Flush latest view state (time, players, toggles) into the matching history entry
+  // before navigating away, so "restore" always shows where you left off.
+  const flushCurrentHistory = useCallback(() => {
+    if (selectedMatchIds.size === 0) return;
+    const current = captureState();
+    const sortedCurrent = JSON.stringify([...selectedMatchIds].sort());
+    setViewHistory(prev => {
+      const idx = prev.findIndex(h =>
+        JSON.stringify([...h.state.selectedMatchIds].sort()) === sortedCurrent,
+      );
+      if (idx < 0) return prev;
+      const next = [...prev];
+      next[idx] = { ...next[idx], state: { ...next[idx].state, ...current } };
+      saveHistory(next);
+      return next;
+    });
+  }, [captureState, selectedMatchIds]);
+
   const pushBackStack = useCallback(() => {
     if (!hasMatchData) return;
+    flushCurrentHistory();
     setBackStack(prev => [captureState(), ...prev].slice(0, 20));
-  }, [captureState, hasMatchData]);
+  }, [captureState, flushCurrentHistory, hasMatchData]);
 
   const restoreState = useCallback((state) => {
     setSelectedMap(state.selectedMap ?? '');
@@ -575,16 +650,17 @@ export default function App() {
     setShowEvents(state.showEvents ?? true);
     setShowHeatmap(state.showHeatmap ?? false);
     setHeatmapType(state.heatmapType ?? 'traffic');
-    setCurrentTime(0);
+    setCurrentTime(state.currentTime ?? 0);
     setIsPlaying(false);
   }, [setCurrentTime]);
 
   const goBack = useCallback(() => {
     const [prev, ...rest] = backStack;
     if (!prev) return;
+    flushCurrentHistory();
     setBackStack(rest);
     restoreState(prev);
-  }, [backStack, restoreState]);
+  }, [backStack, flushCurrentHistory, restoreState]);
 
   // History rename / delete
   const handleRename = useCallback((id, newLabel) => {
@@ -607,12 +683,30 @@ export default function App() {
   const selectAllMatchesForPlayer = useCallback(async (userId) => {
     setPlayerMenu(null);
     try {
-      pushBackStack();
       const matches = await fetchPlayerMatches(userId);
       if (matches.length === 0) return;
-      setSelectedMatchIds(new Set(matches.map(m => m.matchId)));
+      // Restrict to current map if one is selected
+      const filtered = selectedMap ? matches.filter(m => m.mapId === selectedMap) : matches;
+      if (filtered.length === 0) return;
+      const allIds = filtered.map(m => m.matchId);
+      // Persist for tick state
+      setPlayerMatchCache(prev => new Map(prev).set(userId, allIds));
+      const alreadyAllSelected = allIds.every(id => selectedMatchIds.has(id));
+      pushBackStack();
+      if (alreadyAllSelected) {
+        // Deselect all this player's matches
+        setSelectedMatchIds(prev => {
+          const n = new Set(prev);
+          allIds.forEach(id => n.delete(id));
+          return n;
+        });
+      } else {
+        // Select all this player's matches — restrict visible players to just this one
+        pendingPlayerFilter.current = userId;
+        setSelectedMatchIds(new Set(allIds));
+      }
     } catch (err) { console.error(err); }
-  }, [pushBackStack]);
+  }, [pushBackStack, selectedMatchIds, selectedMap]);
 
   const togglePlayer = useCallback(uid => {
     setSelectedPlayers(prev => { const n = new Set(prev); if (n.has(uid)) n.delete(uid); else n.add(uid); return n; });
@@ -639,7 +733,13 @@ export default function App() {
         {/* Map */}
         <Select
           label="Map" value={selectedMap}
-          onChange={v => { pushBackStack(); setSelectedMap(v); setSelectedDates(new Set()); }}
+          onChange={v => {
+            pushBackStack();
+            setSelectedMap(v);
+            setSelectedDates(new Set());
+            setSelectedMatchIds(new Set());
+            setMatchDataMap(new Map());
+          }}
           placeholder="All maps" options={maps.map(m => ({ value: m, label: m }))}
           disabled={!serverReady}
         />
@@ -810,7 +910,7 @@ export default function App() {
       </aside>
 
       {/* ── MAIN ──────────────────────────────────────────────────── */}
-      <main className="flex-1 flex flex-col overflow-hidden min-w-0">
+      <main className="flex-1 flex flex-col min-w-0">
 
         {/* Toolbar */}
         <div className="flex items-center gap-2 px-3 py-2 border-b border-border flex-wrap shrink-0">
@@ -843,15 +943,24 @@ export default function App() {
             </div>
           )}
 
-          {/* Speed */}
-          {hasMatchData && (
-            <div className="flex items-center gap-1">
-              <span className="text-xs text-slate-400">Speed:</span>
-              {[0.5, 1, 2, 4, 8].map(s => (
-                <Btn key={s} label={`${s}×`} active={playSpeed === s} onClick={() => { setPlaySpeed(s); playSpeedRef.current = s; }} />
-              ))}
-            </div>
-          )}
+          {/* Reset button */}
+          <button
+            onClick={() => {
+              setShowTrails(true);
+              setShowEvents(true);
+              setShowHeatmap(false);
+              setHeatmapType('traffic');
+              setPlaySpeed(1);
+              playSpeedRef.current = 1;
+              setCurrentTime(0);
+              setIsPlaying(false);
+              setResetViewKey(k => k + 1);
+            }}
+            className="px-2 py-1.5 rounded text-xs border border-border text-slate-400 hover:border-indigo-500 hover:text-white transition"
+            title="Reset zoom, speed and display options to defaults"
+          >
+            ↺ Reset
+          </button>
 
           {/* History button — always visible, pushed to right */}
           <button
@@ -889,6 +998,7 @@ export default function App() {
               showHeatmap={showHeatmap}
               heatmapType={heatmapType}
               noMatchSelected={!hasMatchData}
+              resetViewKey={resetViewKey}
             />
           ) : (
             <div className="text-slate-600 text-sm text-center">
@@ -937,9 +1047,20 @@ export default function App() {
               {fmtMs(duration)}
             </span>
 
-            <span className="text-xs text-slate-600 flex-none w-20 text-right">
-              {visibleEvents.length} events
-            </span>
+            {/* Speed selector — refs on button itself, no wrapper needed */}
+            <button
+              ref={el => { speedBtnRef.current = el; speedBtnContainerRef.current = el; }}
+              onClick={() => setShowSpeedMenu(v => !v)}
+              className={clsx(
+                'flex-none text-xs font-mono rounded px-2 py-1 border transition min-w-[3rem] text-center',
+                showSpeedMenu
+                  ? 'border-indigo-500 bg-indigo-600/20 text-indigo-300'
+                  : 'border-border bg-surface text-slate-300 hover:border-indigo-400',
+              )}
+              title="Playback speed"
+            >
+              {playSpeed}×
+            </button>
           </div>
         )}
       </main>
@@ -949,6 +1070,8 @@ export default function App() {
         <HistoryPanel
           history={viewHistory}
           onRestore={item => {
+            // Flush latest state into the current history entry before leaving
+            flushCurrentHistory();
             // Suppress auto-save so the renamed label is not overwritten
             suppressHistorySave.current = true;
             // Move item to top of history (preserving its label)
@@ -977,7 +1100,42 @@ export default function App() {
           y={playerMenu.y}
           onClose={() => setPlayerMenu(null)}
           onSelectAllMatches={() => selectAllMatchesForPlayer(playerMenu.userId)}
+          isAllSelected={
+            playerMatchCache.has(playerMenu.userId) &&
+            playerMatchCache.get(playerMenu.userId).every(id => selectedMatchIds.has(id))
+          }
         />
+      )}
+
+      {/* ── SPEED POPUP PORTAL — renders at document.body, escapes all overflow/stacking ── */}
+      {showSpeedMenu && createPortal(
+        (() => {
+          const r = speedBtnRef.current?.getBoundingClientRect();
+          if (!r) return null;
+          return (
+            <div
+              ref={speedPopupRef}
+              className="bg-surface border border-border rounded shadow-xl py-1 min-w-[5rem]"
+              style={{ position: 'fixed', right: window.innerWidth - r.right, bottom: window.innerHeight - r.top + 6, zIndex: 9999 }}
+            >
+              {[0.5, 1, 2, 4, 8].map(s => (
+                <button
+                  key={s}
+                  onClick={() => { setPlaySpeed(s); playSpeedRef.current = s; setShowSpeedMenu(false); }}
+                  className={clsx(
+                    'w-full text-right px-3 py-1.5 text-xs font-mono transition',
+                    playSpeed === s
+                      ? 'text-indigo-300 bg-indigo-600/20'
+                      : 'text-slate-300 hover:bg-panel hover:text-white',
+                  )}
+                >
+                  {s}×
+                </button>
+              ))}
+            </div>
+          );
+        })(),
+        document.body,
       )}
     </div>
   );
