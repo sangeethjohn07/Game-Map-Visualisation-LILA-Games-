@@ -16,6 +16,8 @@ import React, {
   useRef, useEffect, useCallback, useMemo, useState,
 } from 'react';
 
+const API_BASE = import.meta.env.VITE_API_BASE ?? '';
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -325,7 +327,7 @@ export default function MapCanvas({
     loadedMapRef.current = null;
     const filename = MINIMAP_FILES[mapId] ?? `${mapId}_Minimap.png`;
     const img = new Image();
-    img.src = `/minimaps/${filename}`;
+    img.src = `${API_BASE}/minimaps/${filename}`;
     img.onload  = () => { imgRef.current = img; loadedMapRef.current = mapId; setImgSeq(n => n + 1); };
     img.onerror = () => { imgRef.current = null; loadedMapRef.current = mapId; setImgSeq(n => n + 1); };
   }, [mapId]);

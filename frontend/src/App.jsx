@@ -3,7 +3,7 @@ import React, {
 } from 'react';
 import { createPortal } from 'react-dom';
 import clsx from 'clsx';
-import { fetchMaps, fetchDates, fetchMatches, fetchMatch, fetchPlayerMatches } from './api';
+import { fetchStatus, fetchMaps, fetchDates, fetchMatches, fetchMatch, fetchPlayerMatches } from './api';
 import MapCanvas from './Canvas';
 
 // ---------------------------------------------------------------------------
@@ -363,7 +363,7 @@ export default function App() {
     let cancelled = false;
     async function poll() {
       try {
-        const res = await fetch('/api/status').then(r => r.json());
+        const res = await fetchStatus();
         if (cancelled) return;
         if (res.ready) {
           setServerReady(true);

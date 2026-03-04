@@ -74,5 +74,5 @@ export function minimapUrl(mapId) {
     GrandRift: 'GrandRift_Minimap.png',
     Lockdown: 'Lockdown_Minimap.jpg',
   };
-  return `/minimaps/${names[mapId] ?? `${mapId}_Minimap.png`}`;
+  return `${BASE}/minimaps/${names[mapId] ?? `${mapId}_Minimap.png`}`;
 }
