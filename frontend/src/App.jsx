@@ -5,6 +5,7 @@ import { createPortal } from 'react-dom';
 import clsx from 'clsx';
 import { fetchStatus, fetchMaps, fetchDates, fetchMatches, fetchMatch, fetchPlayerMatches } from './api';
 import MapCanvas from './Canvas';
+import HelpPanel from './HelpPanel';
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -354,6 +355,7 @@ export default function App() {
   const [viewHistory, setViewHistory]   = useState(loadHistory);
   const [backStack,   setBackStack]     = useState([]);
   const [showHistory, setShowHistory]   = useState(false);
+  const [showHelp,    setShowHelp]      = useState(false);
   const suppressHistorySave             = useRef(false); // set true when restoring to preserve renamed label
 
   // ── Player context menu ───────────────────────────────────────────────────
@@ -1008,11 +1010,25 @@ export default function App() {
             ↺ Reset
           </button>
 
-          {/* History button — always visible, pushed to right */}
+          {/* Help button */}
+          <button
+            onClick={() => setShowHelp(v => !v)}
+            className={clsx(
+              'ml-auto px-2.5 py-1.5 rounded text-xs border font-semibold transition',
+              showHelp
+                ? 'border-indigo-500 bg-indigo-600 text-white'
+                : 'border-border text-slate-400 hover:border-indigo-500 hover:text-slate-200',
+            )}
+            title="Help & Tutorial"
+          >
+            ?
+          </button>
+
+          {/* History button — always visible */}
           <button
             onClick={() => setShowHistory(v => !v)}
             className={clsx(
-              'ml-auto px-3 py-1.5 rounded text-xs border font-semibold transition flex items-center gap-1.5',
+              'px-3 py-1.5 rounded text-xs border font-semibold transition flex items-center gap-1.5',
               showHistory
                 ? 'border-indigo-500 bg-indigo-600 text-white'
                 : 'border-border text-slate-400 hover:border-indigo-500 hover:text-slate-200',
@@ -1110,6 +1126,9 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {/* ── HELP PANEL (fixed right overlay) ──────────────────────── */}
+      {showHelp && <HelpPanel onClose={() => setShowHelp(false)} />}
 
       {/* ── HISTORY PANEL (fixed right overlay) ───────────────────── */}
       {showHistory && (
