@@ -1,13 +1,20 @@
 /**
  * server.js
  * Express backend for the Player Journey Visualization Tool.
- * Loads all parquet data once at startup, then serves fast cached responses.
+ *
+ * Startup sequence:
+ *   1. Connect to Redis (if REDIS_URL is set)
+ *   2. Try to load cache from Redis → fast startup on warm deploys
+ *   3. If no Redis data, build cache from parquet files → save to Redis
+ *   4. Start file watcher for incremental ingestion of new files
  */
 
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const { buildCache, computeHeatmap } = require('./dataProcessor');
+const { connectRedis, loadCacheFromRedis, saveCacheToRedis } = require('./redisClient');
+const { startFileWatcher } = require('./fileWatcher');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -22,23 +29,51 @@ app.use(
 );
 
 // ---------------------------------------------------------------------------
-// Cache bootstrap — load once on startup
+// Cache bootstrap
 // ---------------------------------------------------------------------------
 
 let cache = null;
 let cacheError = null;
 
 (async () => {
+  // 1. Connect to Redis (no-op if REDIS_URL not set)
+  await connectRedis();
+
+  // 2. Try loading from Redis first (fast path)
+  try {
+    const redisCache = await loadCacheFromRedis();
+    if (redisCache) {
+      cache = redisCache;
+      console.log('[server] Cache loaded from Redis — API ready.');
+      startFileWatcher(cache);
+      return;
+    }
+  } catch (err) {
+    console.warn('[server] Redis load error:', err.message);
+  }
+
+  // 3. Fall back to building from parquet files
+  console.log('[server] Building cache from parquet files...');
   try {
     cache = await buildCache();
-    console.log('[server] Cache ready. API accepting requests.');
+    console.log('[server] Cache ready — API accepting requests.');
+
+    // Save to Redis so next startup is fast
+    await saveCacheToRedis(cache);
   } catch (err) {
     cacheError = err;
     console.error('[server] Fatal: cache build failed:', err);
+    return;
   }
+
+  // 4. Start file watcher for incremental updates
+  startFileWatcher(cache);
 })();
 
-// Middleware: block requests until cache is ready
+// ---------------------------------------------------------------------------
+// Middleware: block API requests until cache is ready
+// ---------------------------------------------------------------------------
+
 function requireCache(req, res, next) {
   if (cacheError) return res.status(500).json({ error: 'Data load failed', detail: cacheError.message });
   if (!cache) return res.status(503).json({ error: 'Data still loading — please retry in a moment' });
@@ -105,9 +140,6 @@ app.get('/api/matches', requireCache, (req, res) => {
 /**
  * GET /api/match/:matchId
  * → { matchId, mapId, date, durationMs, players, events }
- *
- * events are pre-sorted by ts (relative to match start).
- * Each event: { userId, isBot, ts, event, pixelX, pixelY }
  */
 app.get('/api/match/:matchId', requireCache, (req, res) => {
   const match = cache.matches.get(req.params.matchId);
@@ -144,7 +176,6 @@ app.get('/api/heatmap/:matchId', requireCache, (req, res) => {
 /**
  * GET /api/player/:userId/matches
  * → [{matchId, mapId, date, playerCount, botCount, durationMs}]
- * Returns all matches a specific player has appeared in.
  */
 app.get('/api/player/:userId/matches', requireCache, (req, res) => {
   const { userId } = req.params;
@@ -170,5 +201,5 @@ app.get('/api/player/:userId/matches', requireCache, (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[server] Listening on http://localhost:${PORT}`);
-  console.log('[server] Loading parquet data in background...');
+  console.log('[server] Loading data...');
 });

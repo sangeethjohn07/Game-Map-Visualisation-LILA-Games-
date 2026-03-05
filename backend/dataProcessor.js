@@ -4,6 +4,8 @@
  *  - Decoded event strings
  *  - Pre-computed minimap pixel coordinates
  *  - Match/player/map/date indices
+ *
+ * Also exports processFile() for incremental ingestion (file watcher).
  */
 
 const path = require('path');
@@ -77,16 +79,11 @@ function decodeEvent(val) {
 /**
  * @dsnp/parquetjs returns TIMESTAMP columns as Date objects, but treats the
  * raw INT64 (which the game stores as Unix SECONDS) as if it were milliseconds.
- * This means Date.getTime() returns the raw second value (e.g. 1_770_754_537)
- * instead of the correct millisecond value (1_770_754_537_000).
- *
  * Fix: multiply Date.getTime() × 1000 to recover real ms.
- * Consequence: diffs between events become seconds × 1000 = correct ms.
- * e.g. a 382-unit diff → 382 000 ms ≈ 6 min 22 s match duration.
  */
 function parseTs(val) {
-  if (val instanceof Date) return val.getTime() * 1000; // raw = Unix seconds; convert → ms
-  if (typeof val === 'bigint') return Number(val);       // already ms if returned as BigInt
+  if (val instanceof Date) return val.getTime() * 1000;
+  if (typeof val === 'bigint') return Number(val);
   return Number(val);
 }
 
@@ -106,23 +103,21 @@ async function readParquetFile(filePath) {
     await reader.close();
     return rows;
   } catch (err) {
-    // Silently skip corrupt / incompatible files
     return [];
   }
 }
 
 // ---------------------------------------------------------------------------
-// Main cache builder
+// Main cache builder (full rebuild from disk)
 // ---------------------------------------------------------------------------
 
 async function buildCache() {
   console.log(`[dataProcessor] Loading data from: ${DATA_PATH}`);
   const t0 = Date.now();
 
-  /** @type {Map<string, import('./types').MatchData>} */
   const matches = new Map();
-  const mapMatches = new Map();   // mapId  -> Set<matchId>
-  const dateMatches = new Map();  // date   -> Set<matchId>
+  const mapMatches = new Map();
+  const dateMatches = new Map();
   const maps = new Set();
 
   let totalFiles = 0;
@@ -147,7 +142,6 @@ async function buildCache() {
 
       const mapId = String(rows[0].map_id || 'Unknown');
 
-      // Build event list for this player in this match
       const playerEvents = [];
       for (const row of rows) {
         const x = parseFloat(row.x) || 0;
@@ -164,7 +158,6 @@ async function buildCache() {
       }
       playerEvents.sort((a, b) => a.ts - b.ts);
 
-      // Initialise match entry on first encounter
       if (!matches.has(matchId)) {
         matches.set(matchId, {
           matchId,
@@ -175,6 +168,7 @@ async function buildCache() {
           playerCount: 0,
           botCount: 0,
           durationMs: 0,
+          rawMinTs: null, // set during post-processing
         });
         maps.add(mapId);
 
@@ -196,13 +190,14 @@ async function buildCache() {
     }
   }
 
-  // Post-process: sort events, normalise timestamps, compute counts
+  // Post-process: sort events, store rawMinTs, normalise timestamps, compute counts
   for (const match of matches.values()) {
     match.events.sort((a, b) => a.ts - b.ts);
 
     if (match.events.length > 0) {
       const minTs = match.events[0].ts;
       const maxTs = match.events[match.events.length - 1].ts;
+      match.rawMinTs = minTs;          // ← stored so incremental updates can normalize consistently
       match.durationMs = maxTs - minTs;
       for (const ev of match.events) ev.ts -= minTs;
     }
@@ -217,6 +212,113 @@ async function buildCache() {
   );
 
   return { maps, matches, mapMatches, dateMatches };
+}
+
+// ---------------------------------------------------------------------------
+// Incremental: process a single new file into an existing live cache
+// ---------------------------------------------------------------------------
+
+/**
+ * Merges one new parquet file into the live in-memory cache.
+ * Called by the file watcher when a new .nakama-0 file appears.
+ *
+ * @param {string} filePath  - absolute path to the new file
+ * @param {string} date      - folder name, e.g. 'February_15'
+ * @param {object} cache     - live cache object ({ maps, matches, mapMatches, dateMatches })
+ * @returns {string|null}    - matchId that was updated, or null if skipped
+ */
+async function processFile(filePath, date, cache) {
+  const filename = path.basename(filePath);
+  const parsed = parseFilename(filename);
+  if (!parsed) {
+    console.warn(`[dataProcessor] Cannot parse filename: ${filename}`);
+    return null;
+  }
+
+  const { userId, matchId } = parsed;
+  const bot = isBot(userId);
+
+  const rows = await readParquetFile(filePath);
+  if (rows.length === 0) {
+    console.warn(`[dataProcessor] No rows in file: ${filename}`);
+    return null;
+  }
+
+  const mapId = String(rows[0].map_id || 'Unknown');
+
+  // Build raw events (un-normalized timestamps)
+  const rawEvents = [];
+  for (const row of rows) {
+    const x = parseFloat(row.x) || 0;
+    const z = parseFloat(row.z) || 0;
+    const { pixelX, pixelY } = worldToMinimap(x, z, mapId);
+    rawEvents.push({
+      userId,
+      isBot: bot,
+      ts: parseTs(row.ts),
+      event: decodeEvent(row.event),
+      pixelX,
+      pixelY,
+    });
+  }
+  rawEvents.sort((a, b) => a.ts - b.ts);
+
+  if (cache.matches.has(matchId)) {
+    // ── Existing match: merge new player's events ───────────────────────────
+    const match = cache.matches.get(matchId);
+
+    // Skip if this player was already processed (de-dupe)
+    if (match.players.some(p => p.userId === userId)) {
+      console.log(`[dataProcessor] Duplicate file ignored: ${filename}`);
+      return null;
+    }
+
+    match.players.push({ userId, isBot: bot });
+
+    const rawMinTs = match.rawMinTs ?? 0;
+    for (const ev of rawEvents) {
+      match.events.push({ ...ev, ts: ev.ts - rawMinTs });
+    }
+
+    match.events.sort((a, b) => a.ts - b.ts);
+
+    // Recompute duration (max normalized ts is already relative to rawMinTs)
+    if (match.events.length > 0) {
+      match.durationMs = match.events[match.events.length - 1].ts;
+    }
+
+    match.playerCount = match.players.filter(p => !p.isBot).length;
+    match.botCount = match.players.filter(p => p.isBot).length;
+
+  } else {
+    // ── New match: initialize from first file ───────────────────────────────
+    const rawMinTs = rawEvents.length > 0 ? rawEvents[0].ts : 0;
+    const rawMaxTs = rawEvents.length > 0 ? rawEvents[rawEvents.length - 1].ts : 0;
+    const normalizedEvents = rawEvents.map(ev => ({ ...ev, ts: ev.ts - rawMinTs }));
+
+    cache.matches.set(matchId, {
+      matchId,
+      mapId,
+      date,
+      players: [{ userId, isBot: bot }],
+      events: normalizedEvents,
+      playerCount: bot ? 0 : 1,
+      botCount: bot ? 1 : 0,
+      durationMs: rawMaxTs - rawMinTs,
+      rawMinTs,
+    });
+
+    cache.maps.add(mapId);
+
+    if (!cache.mapMatches.has(mapId)) cache.mapMatches.set(mapId, new Set());
+    cache.mapMatches.get(mapId).add(matchId);
+
+    if (!cache.dateMatches.has(date)) cache.dateMatches.set(date, new Set());
+    cache.dateMatches.get(date).add(matchId);
+  }
+
+  console.log(`[dataProcessor] Ingested ${filename} → match ${matchId}`);
+  return matchId;
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +342,6 @@ function computeHeatmap(events, type, gridSize = 32) {
     grid[cy * gridSize + cx]++;
   }
 
-  // Log-scale normalisation
   let max = 0;
   for (let i = 0; i < grid.length; i++) if (grid[i] > max) max = grid[i];
   if (max > 0) {
@@ -253,4 +354,11 @@ function computeHeatmap(events, type, gridSize = 32) {
   return grid;
 }
 
-module.exports = { buildCache, computeHeatmap, MAP_CONFIGS };
+module.exports = {
+  buildCache,
+  processFile,
+  computeHeatmap,
+  MAP_CONFIGS,
+  DATA_PATH,
+  parseFilename,
+};
