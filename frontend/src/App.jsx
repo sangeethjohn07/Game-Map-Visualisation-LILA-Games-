@@ -325,6 +325,7 @@ export default function App() {
   const [showEvents,  setShowEvents]  = useState(true);
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [heatmapType, setHeatmapType] = useState('traffic');
+  const [soloEventType, setSoloEventType] = useState(null);
   const [isPlaying,    setIsPlaying]   = useState(false);
   const [playSpeed,    setPlaySpeed]   = useState(1);
   const [showSpeedMenu, setShowSpeedMenu] = useState(false);
@@ -486,6 +487,11 @@ export default function App() {
     [allEvents, selectedPlayers, displayTime], // displayTime triggers re-memo on playback
   );
 
+  const canvasEvents = useMemo(
+    () => soloEventType ? visibleEvents.filter(ev => ev.event === soloEventType) : visibleEvents,
+    [visibleEvents, soloEventType],
+  );
+
   const startPositions = useMemo(() => {
     const starts = {};
     for (const ev of allEvents) {
@@ -504,15 +510,40 @@ export default function App() {
 
   const hasMatchData = matchDataMap.size > 0;
 
+  // Stable sequential match numbers: sort all matches by date then matchId (deterministic across restarts)
+  const matchNumberMap = useMemo(() => {
+    const sorted = [...matchList].sort((a, b) =>
+      a.date !== b.date ? a.date.localeCompare(b.date) : a.matchId.localeCompare(b.matchId)
+    );
+    const map = new Map();
+    sorted.forEach((m, i) => map.set(m.matchId, i + 1));
+    return map;
+  }, [matchList]);
+
+  // Map locked to the first selected match — prevents mixing matches from different maps
+  const selectedMapId = useMemo(() => {
+    if (selectedMatchIds.size === 0) return null;
+    const firstId = [...selectedMatchIds][0];
+    return matchList.find(m => m.matchId === firstId)?.mapId ?? null;
+  }, [selectedMatchIds, matchList]);
+
   // ── Filtered + sorted match list (selected always on top) ─────────────────
   const filteredMatches = useMemo(() => {
     let list = matchList;
+    // Once a match is selected, only show matches on the same map
+    if (selectedMapId) list = list.filter(m => m.mapId === selectedMapId);
     if (matchSearch) {
       const q = matchSearch.toLowerCase();
-      list = list.filter(m =>
-        m.matchId.toLowerCase().includes(q) ||
-        m.mapId.toLowerCase().includes(q) ||
-        m.date.toLowerCase().includes(q),
+      list = list.filter(m => {
+        const num = matchNumberMap.get(m.matchId);
+        return (
+          `match ${num}`.includes(q) ||
+          String(num).includes(q) ||
+          m.matchId.toLowerCase().includes(q) ||
+          m.mapId.toLowerCase().includes(q) ||
+          m.date.toLowerCase().replace(/_/g, ' ').includes(q)
+        );
+      },
       );
     }
     return [...list].sort((a, b) => {
@@ -525,10 +556,10 @@ export default function App() {
         case 'players':  return b.playerCount - a.playerCount;
         case 'bots':     return b.botCount - a.botCount;
         case 'duration': return b.durationMs - a.durationMs;
-        default:         return a.date.localeCompare(b.date);
+        default:         return (matchNumberMap.get(a.matchId) ?? 0) - (matchNumberMap.get(b.matchId) ?? 0);
       }
     });
-  }, [matchList, matchSearch, matchSort, selectedMatchIds]);
+  }, [matchList, matchSearch, matchSort, selectedMatchIds, selectedMapId, matchNumberMap]);
 
   // ── Filtered player list ───────────────────────────────────────────────────
   const filteredPlayers = useMemo(() => {
@@ -826,7 +857,7 @@ export default function App() {
                 )}>
                   <input type="checkbox" checked={checked} onChange={() => toggleMatch(m.matchId)} className="flex-none mt-0.5" />
                   <div className="flex flex-col min-w-0 flex-1">
-                    <span className="font-mono text-xs truncate text-slate-300">{m.matchId.slice(0, 12)}…</span>
+                    <span className="font-mono text-xs truncate text-slate-300">Match {matchNumberMap.get(m.matchId)} · {m.matchId.slice(0, 6)}</span>
                     <span className="text-[11px] text-slate-500">
                       ({m.playerCount}P · {m.botCount}B) · {fmtMs(m.durationMs)}
                     </span>
@@ -891,21 +922,35 @@ export default function App() {
 
         {/* Legend */}
         <div className="mt-auto flex flex-col gap-1 border-t border-border pt-3">
-          <p className="text-xs text-slate-400 font-medium uppercase tracking-wide mb-1">Legend</p>
+          <p className="text-xs text-slate-400 font-medium uppercase tracking-wide mb-1">Legend <span className="normal-case font-normal text-slate-600">(click to filter)</span></p>
           {[
-            { color: '#ef4444', sym: '●', label: 'Kill (player)' },
-            { color: '#dc2626', sym: '●', label: 'BotKill' },
-            { color: '#7c3aed', sym: '✕', label: 'Killed' },
-            { color: '#f97316', sym: '✕', label: 'BotKilled' },
-            { color: '#eab308', sym: '♦', label: 'Loot' },
-            { color: '#a855f7', sym: '★', label: 'KilledByStorm' },
-            { color: '#ffffff', sym: '○', label: 'Start position' },
-          ].map(({ color, sym, label }) => (
-            <div key={label} className="flex items-center gap-2 text-xs">
-              <span style={{ color }} className="w-4 text-center font-bold">{sym}</span>
-              <span className="text-slate-300">{label}</span>
-            </div>
-          ))}
+            { color: '#ef4444', sym: '●', label: 'Kill (player)', eventType: 'Kill' },
+            { color: '#dc2626', sym: '●', label: 'BotKill',       eventType: 'BotKill' },
+            { color: '#7c3aed', sym: '✕', label: 'Killed',        eventType: 'Killed' },
+            { color: '#f97316', sym: '✕', label: 'BotKilled',     eventType: 'BotKilled' },
+            { color: '#eab308', sym: '♦', label: 'Loot',          eventType: 'Loot' },
+            { color: '#a855f7', sym: '★', label: 'KilledByStorm', eventType: 'KilledByStorm' },
+            { color: '#ffffff', sym: '○', label: 'Start position', eventType: null },
+          ].map(({ color, sym, label, eventType }) => {
+            const active = soloEventType === eventType && eventType !== null;
+            const dimmed = soloEventType !== null && !active;
+            return (
+              <button
+                key={label}
+                onClick={() => eventType && setSoloEventType(active ? null : eventType)}
+                className={clsx(
+                  'flex items-center gap-2 text-xs px-1 py-0.5 rounded transition text-left',
+                  eventType ? 'cursor-pointer hover:bg-surface' : 'cursor-default',
+                  active && 'bg-surface ring-1 ring-indigo-500/50',
+                  dimmed && 'opacity-30',
+                )}
+              >
+                <span style={{ color }} className="w-4 text-center font-bold flex-none">{sym}</span>
+                <span className="text-slate-300">{label}</span>
+                {active && <span className="ml-auto text-indigo-400 text-[10px]">✓</span>}
+              </button>
+            );
+          })}
         </div>
       </aside>
 
@@ -950,6 +995,7 @@ export default function App() {
               setShowEvents(true);
               setShowHeatmap(false);
               setHeatmapType('traffic');
+              setSoloEventType(null);
               setPlaySpeed(1);
               playSpeedRef.current = 1;
               setCurrentTime(0);
@@ -989,7 +1035,7 @@ export default function App() {
           {activeMapId ? (
             <MapCanvas
               mapId={activeMapId}
-              events={visibleEvents}
+              events={canvasEvents}
               startPositions={startPositions}
               selectedPlayers={selectedPlayers}
               colorMap={colorMap}
