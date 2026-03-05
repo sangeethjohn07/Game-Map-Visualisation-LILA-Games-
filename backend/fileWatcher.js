@@ -11,7 +11,7 @@
 
 const chokidar = require('chokidar');
 const path = require('path');
-const { processFile, DATA_PATH } = require('./dataProcessor');
+const { processFile, DATA_PATH, getFolderCounts } = require('./dataProcessor');
 const { saveCacheToRedis } = require('./redisClient');
 
 /**
@@ -45,8 +45,8 @@ function startFileWatcher(cache, onUpdate) {
       if (matchId) {
         console.log(`[watcher] Successfully ingested → match ${matchId}`);
 
-        // Persist updated cache to Redis
-        await saveCacheToRedis(cache);
+        // Persist updated cache to Redis with updated folder counts
+        await saveCacheToRedis(cache, getFolderCounts());
 
         if (typeof onUpdate === 'function') onUpdate(matchId);
       }

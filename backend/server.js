@@ -12,7 +12,7 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const { buildCache, computeHeatmap } = require('./dataProcessor');
+const { buildCache, computeHeatmap, getFolderCounts, processFolderIncremental } = require('./dataProcessor');
 const { connectRedis, loadCacheFromRedis, saveCacheToRedis } = require('./redisClient');
 const { startFileWatcher } = require('./fileWatcher');
 
@@ -39,12 +39,40 @@ let cacheError = null;
   // 1. Connect to Redis (no-op if REDIS_URL not set)
   await connectRedis();
 
-  // 2. Try loading from Redis first (fast path)
+  // 2. Get current per-folder file counts from disk
+  const diskCounts = getFolderCounts();
+  console.log(`[server] Disk folders: ${JSON.stringify(diskCounts)}`);
+
+  // 3. Try loading from Redis
   try {
-    const redisCache = await loadCacheFromRedis();
-    if (redisCache) {
+    const result = await loadCacheFromRedis();
+    if (result) {
+      const { cache: redisCache, folderCounts: cachedCounts } = result;
+
+      // Find folders that are new or have more files than Redis recorded
+      const changedFolders = Object.keys(diskCounts).filter(
+        folder => diskCounts[folder] !== cachedCounts[folder]
+      );
+
+      if (changedFolders.length === 0) {
+        // All folders match — use Redis cache as-is (fast path)
+        cache = redisCache;
+        console.log('[server] Cache loaded from Redis — API ready.');
+        startFileWatcher(cache);
+        return;
+      }
+
+      // Some folders changed — load Redis cache and process only those folders
+      console.log(`[server] Changed folders: ${changedFolders.join(', ')}`);
       cache = redisCache;
-      console.log('[server] Cache loaded from Redis — API ready.');
+
+      for (const folder of changedFolders) {
+        const newFiles = await processFolderIncremental(folder, cache);
+        console.log(`[server] ${folder}: ${newFiles} new file(s) ingested`);
+      }
+
+      await saveCacheToRedis(cache, diskCounts);
+      console.log('[server] Cache updated — API ready.');
       startFileWatcher(cache);
       return;
     }
@@ -52,21 +80,19 @@ let cacheError = null;
     console.warn('[server] Redis load error:', err.message);
   }
 
-  // 3. Fall back to building from parquet files
+  // 4. No Redis data — full build from parquet
   console.log('[server] Building cache from parquet files...');
   try {
     cache = await buildCache();
     console.log('[server] Cache ready — API accepting requests.');
-
-    // Save to Redis so next startup is fast
-    await saveCacheToRedis(cache);
+    await saveCacheToRedis(cache, diskCounts);
   } catch (err) {
     cacheError = err;
     console.error('[server] Fatal: cache build failed:', err);
     return;
   }
 
-  // 4. Start file watcher for incremental updates
+  // 5. Start file watcher for incremental updates
   startFileWatcher(cache);
 })();
 

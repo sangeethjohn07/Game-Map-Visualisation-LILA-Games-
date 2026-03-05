@@ -352,10 +352,58 @@ function computeHeatmap(events, type, gridSize = 32) {
   return grid;
 }
 
+// ---------------------------------------------------------------------------
+// Folder-level counts — used for incremental Redis cache invalidation
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns a per-folder file count map: { "February_10": 234, "February_15": 80, ... }
+ * Stable across git clones (file counts don't reset like mtimes do).
+ * Used to detect which specific folders have new data since last Redis save.
+ */
+function getFolderCounts() {
+  const counts = {};
+  try {
+    for (const date of getDateFolders()) {
+      const folder = path.join(DATA_PATH, date);
+      if (fs.existsSync(folder)) {
+        counts[date] = fs.readdirSync(folder).filter(f => f.endsWith('.nakama-0')).length;
+      }
+    }
+  } catch (_) {}
+  return counts;
+}
+
+/**
+ * Processes all files in a single date folder and merges into an existing cache.
+ * Used for incremental startup: only runs on folders where file count changed.
+ * Already-processed files are safely skipped via player deduplication in processFile().
+ *
+ * @param {string} date   - folder name, e.g. 'February_15'
+ * @param {object} cache  - live cache to merge into
+ * @returns {number}      - count of newly ingested files
+ */
+async function processFolderIncremental(date, cache) {
+  const folderPath = path.join(DATA_PATH, date);
+  if (!fs.existsSync(folderPath)) return 0;
+
+  const files = fs.readdirSync(folderPath).filter(f => f.endsWith('.nakama-0'));
+  let newCount = 0;
+
+  for (const file of files) {
+    const matchId = await processFile(path.join(folderPath, file), date, cache);
+    if (matchId) newCount++;
+  }
+
+  return newCount;
+}
+
 module.exports = {
   buildCache,
   processFile,
+  processFolderIncremental,
   computeHeatmap,
   DATA_PATH,
   parseFilename,
+  getFolderCounts,
 };

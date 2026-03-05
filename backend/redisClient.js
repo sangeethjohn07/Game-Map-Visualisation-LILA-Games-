@@ -16,7 +16,7 @@ const { promisify } = require('util');
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
 
-const CACHE_KEY = 'lila:cache:v1';
+const CACHE_KEY = 'lila:cache:v2'; // v2: folderCounts replaces single fingerprint
 
 let client = null;
 let connected = false;
@@ -75,8 +75,9 @@ function isRedisAvailable() {
 // Maps and Sets are not JSON-serializable — convert to plain arrays/objects.
 // ---------------------------------------------------------------------------
 
-function serializeCache(cache) {
+function serializeCache(cache, folderCounts = {}) {
   return JSON.stringify({
+    folderCounts,                  // { "February_10": 234, "February_15": 80, ... }
     maps: [...cache.maps],
     matches: [...cache.matches.entries()],
     mapMatches: [...cache.mapMatches.entries()].map(([k, v]) => [k, [...v]]),
@@ -87,10 +88,13 @@ function serializeCache(cache) {
 function deserializeCache(json) {
   const data = JSON.parse(json);
   return {
-    maps: new Set(data.maps),
-    matches: new Map(data.matches),
-    mapMatches: new Map(data.mapMatches.map(([k, v]) => [k, new Set(v)])),
-    dateMatches: new Map(data.dateMatches.map(([k, v]) => [k, new Set(v)])),
+    folderCounts: data.folderCounts ?? {},
+    cache: {
+      maps: new Set(data.maps),
+      matches: new Map(data.matches),
+      mapMatches: new Map(data.mapMatches.map(([k, v]) => [k, new Set(v)])),
+      dateMatches: new Map(data.dateMatches.map(([k, v]) => [k, new Set(v)])),
+    },
   };
 }
 
@@ -103,12 +107,12 @@ function deserializeCache(json) {
  * @param {object} cache - live cache from buildCache() / processFile()
  * @returns {boolean} true on success
  */
-async function saveCacheToRedis(cache) {
+async function saveCacheToRedis(cache, folderCounts = {}) {
   if (!isRedisAvailable()) return false;
 
   try {
     const t0 = Date.now();
-    const json = serializeCache(cache);
+    const json = serializeCache(cache, folderCounts);
     const compressed = await gzip(json);
     const b64 = compressed.toString('base64');
 
@@ -143,12 +147,12 @@ async function loadCacheFromRedis() {
 
     const compressed = Buffer.from(b64, 'base64');
     const json = (await gunzip(compressed)).toString('utf-8');
-    const cache = deserializeCache(json);
+    const { cache, folderCounts } = deserializeCache(json);
 
     console.log(
-      `[redis] Cache loaded — ${cache.matches.size} matches, ${cache.maps.size} maps`
+      `[redis] Cache loaded — ${cache.matches.size} matches, ${cache.maps.size} maps, ${Object.keys(folderCounts).length} folders`
     );
-    return cache;
+    return { cache, folderCounts };
   } catch (err) {
     console.warn('[redis] Load failed:', err.message);
     return null;

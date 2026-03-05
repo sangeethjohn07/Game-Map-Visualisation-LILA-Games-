@@ -17,7 +17,7 @@ if (fs.existsSync(envPath)) {
   require('dotenv').config({ path: envPath });
 }
 
-const { buildCache } = require('../dataProcessor');
+const { buildCache, getFolderCounts } = require('../dataProcessor');
 const {
   connectRedis,
   saveCacheToRedis,
@@ -54,9 +54,10 @@ async function main() {
     process.exit(1);
   }
 
-  // 3. Save to Redis
+  // 3. Save to Redis with current folder counts
+  const folderCounts = getFolderCounts();
   console.log('[bulkSave] Saving cache to Redis...');
-  const saved = await saveCacheToRedis(cache);
+  const saved = await saveCacheToRedis(cache, folderCounts);
   if (!saved) {
     console.error('[bulkSave] ERROR: Failed to save cache to Redis.');
     await disconnectRedis();
