@@ -16,19 +16,17 @@ const DATA_PATH = process.env.DATA_PATH
   ? path.resolve(process.env.DATA_PATH)
   : path.join(__dirname, '..', 'player_data');
 
-const DATE_FOLDERS = [
-  'February_10',
-  'February_11',
-  'February_12',
-  'February_13',
-  'February_14',
-];
+// Auto-detect date folders from DATA_PATH instead of hardcoding.
+// Any subdirectory that contains .nakama-0 files will be included.
+function getDateFolders() {
+  if (!fs.existsSync(DATA_PATH)) return [];
+  return fs.readdirSync(DATA_PATH, { withFileTypes: true })
+    .filter(e => e.isDirectory() && e.name !== 'minimaps')
+    .map(e => e.name)
+    .sort();
+}
 
-const MAP_CONFIGS = {
-  AmbroseValley: { scale: 900, originX: -370, originZ: -473 },
-  GrandRift: { scale: 581, originX: -290, originZ: -290 },
-  Lockdown: { scale: 1000, originX: -500, originZ: -500 },
-};
+const { MAP_CONFIGS } = require('./mapConfigs');
 
 // ---------------------------------------------------------------------------
 // Coordinate helpers
@@ -124,7 +122,7 @@ async function buildCache() {
   let processed = 0;
   let skipped = 0;
 
-  for (const date of DATE_FOLDERS) {
+  for (const date of getDateFolders()) {
     const folderPath = path.join(DATA_PATH, date);
     if (!fs.existsSync(folderPath)) continue;
 
@@ -358,7 +356,6 @@ module.exports = {
   buildCache,
   processFile,
   computeHeatmap,
-  MAP_CONFIGS,
   DATA_PATH,
   parseFilename,
 };
